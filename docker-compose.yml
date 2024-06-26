@@ -1,0 +1,480 @@
+version: "3.1"
+
+volumes:
+  postgresql_data:
+  ldap_data:
+  ldap_config:
+  geoserver_geodata:
+  geoserver_datadir:
+  geoserver_tiles:
+  geoserver_native_libs:
+  mapstore_extensions:
+  geonetwork_datadir:
+  datafeeder_uploads:
+  datafeeder_postgis_data:
+  esdata:
+  georchestra_datadir:
+
+networks:
+  demonet:
+
+secrets:
+  slapd_password:
+    file: ./secrets/slapd_password.txt
+  geoserver_privileged_user_passwd:
+    file: ./secrets/geoserver_privileged_user_passwd.txt
+
+services:
+
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.insecure=true"  
+      - "--providers.docker=true" 
+      - "--providers.docker.exposedbydefault=false" 
+      - "--entrypoints.http.address=:80"
+    ports:
+      - "8084:8080"
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+
+  copy-datadir:
+    image: alpine
+    command: sh -c "rm -r /etc/georchestra/* ; cp -r -f -v /mnt/datadir/* /etc/georchestra/ ; chmod 777 -R -v /etc/georchestra/" # "sleep 6000"
+    volumes:
+      - ./config:/mnt/datadir
+      - georchestra_datadir:/etc/georchestra
+
+  envsubst:
+    image: georchestra/k8s-initcontainer-envsubst
+    depends_on:
+      copy-datadir:
+        condition: service_completed_successfully
+    environment:
+      - DEBUG=yes
+      - SUBST_FILES=/etc/georchestra/security-proxy/targets-mapping.properties /etc/georchestra/datafeeder/frontend-config.json /etc/georchestra/geonetwork/microservices/ogc-api-records/config.yml
+    env_file:
+      - .envs-hosts
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+
+  database:
+    image: georchestra/database:23.0.x
+    env_file:
+      - .envs-database-georchestra
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+    restart: always
+
+  static:
+    image: nginx:stable
+    restart: unless-stopped
+    volumes:
+      - ./resources/static:/usr/share/nginx/html:ro
+      - /etc/localtime:/etc/localtime:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.static.rule=Host(`georchestra.localhost`)"
+      - "traefik.http.services.geoserver.loadbalancer.server.port=80"
+      - "traefik.http.routers.static.priority=1"
+    ports:
+      - "3005:80"
+
+  ldap:
+    image: georchestra/ldap:23.0.x
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    secrets:
+      - slapd_password
+      - geoserver_privileged_user_passwd
+    environment:
+      - SLAPD_ORGANISATION=georchestra
+      - SLAPD_DOMAIN=georchestra.org
+      - SLAPD_PASSWORD_FILE=/run/secrets/slapd_password
+      - SLAPD_PASSWORD=
+      - GEOSERVER_PRIVILEGED_USER_PASSWORD_FILE=/run/secrets/geoserver_privileged_user_passwd
+      - SLAPD_LOG_LEVEL=32768 
+      - RUN_AS_UID=0
+      - RUN_AS_GID=0
+      - LDAPHOST=localhost 
+    env_file:
+      - .envs-ldap
+    volumes:
+      - ldap_data:/var/lib/ldap
+      - ldap_config:/etc/ldap
+    restart: always
+    ports:
+      - '10389:389'
+
+  proxy:
+    image: georchestra/security-proxy:23.0.x
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/_static/bootstrap_3.0.0/css/bootstrap-theme.min.css >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      ldap:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=1G
+    env_file:
+      - .envs-common
+      - .envs-ldap
+      - .envs-hosts
+      - .envs-database-georchestra
+    restart: always
+
+  cas:
+    image: georchestra/cas:23.0.0-georchestra
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.cas.rule=Host(`georchestra.localhost`) && PathPrefix(`/cas`)"
+      - "traefik.http.services.cas.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/cas/login >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      ldap:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=1G
+    env_file:
+      - .envs-common
+      - .envs-ldap
+      - .envs-database-georchestra
+    ports:
+      - "3008:8080"
+    networks:
+      - demonet
+
+  header:
+    image: georchestra/header:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.header.rule=Host(`georchestra.localhost`) && PathPrefix(`/header`)"
+      - "traefik.http.services.header.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/header/img/logo.png >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=512M
+    env_file:
+      - .envs-common
+    ports:
+      - "3002:8080"
+    restart: always
+
+  geoserver:
+    image: georchestra/geoserver:23.0.6
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.geoserver.rule=Host(`georchestra.localhost`) && PathPrefix(`/geoserver`)"
+      - "traefik.http.services.geoserver.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/geoserver/gwc/service/wmts?SERVICE=WMTS&REQUEST=GetCapabilities >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      ldap:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+      - geoserver_datadir:/mnt/geoserver_datadir
+      - geoserver_geodata:/mnt/geoserver_geodata
+      - geoserver_tiles:/mnt/geoserver_tiles
+      - geoserver_native_libs:/mnt/geoserver_native_libs
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=2048M
+      - XMX=8G
+    ports:
+      - "3003:8080"
+    env_file:
+      - .envs-database-georchestra
+      - .envs-database-datafeeder
+
+
+  console:
+    image: georchestra/console:23.0.x
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.console.rule=Host(`georchestra.localhost`) && PathPrefix(`/console`)"
+      - "traefik.http.services.console.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/console/account/new >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      ldap:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=1G
+    env_file:
+      - .envs-common
+      - .envs-ldap
+      - .envs-database-georchestra
+    ports:
+      - "3007:8080"
+
+  geonetwork:
+    image: georchestra/geonetwork:23.0.x
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.geonetwork.rule=Host(`georchestra.localhost`) && PathPrefix(`/geonetwork`)"
+      - "traefik.http.services.geonetwork.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/geonetwork/srv/eng/catalog.search >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      #console:
+        #condition: service_healthy
+      database:
+        condition: service_healthy
+      kibana:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+      - geonetwork_datadir:/mnt/geonetwork_datadir
+    environment:
+      - JAVA_OPTIONS=-Duser.home=/tmp/jetty -Dgeorchestra.datadir=/etc/georchestra -Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=5005 -Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=6G
+    env_file:
+      - .envs-hosts
+      - .envs-database-georchestra
+    networks:
+      - demonet
+    ports:
+      - "3006:8080"
+    restart: always
+
+  datahub:
+    image: geonetwork/geonetwork-ui-datahub:main-421a7506
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.datahub.rule=Host(`georchestra.localhost`) && PathPrefix(`/datahub`)"
+      - "traefik.http.services.datahub.loadbalancer.server.port=80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:80/datahub/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    environment:
+      ASSETS_DIRECTORY_OVERRIDE: /etc/georchestra/datahub/assets
+      CONFIG_DIRECTORY_OVERRIDE: /etc/georchestra/datahub/conf
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+      - type: bind
+        source: ./config/
+        target: /etc/georchestra
+    ports:
+      - "3004:80"
+    restart: always
+
+  analytics:
+    image: georchestra/analytics:23.0.x
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/analytics/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      database:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    environment:
+      - JAVA_OPTIONS=-Dorg.eclipse.jetty.annotations.AnnotationParser.LEVEL=OFF
+      - XMS=256M
+      - XMX=1G
+    env_file:
+      - .envs-database-georchestra
+    restart: always
+
+  mapstore:
+    image: georchestra/mapstore:2022.02.01-geOrchestra
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mapstore.rule=Host(`georchestra.localhost`) && PathPrefix(`/mapstore`)"
+      - "traefik.http.services.mapstore.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/mapstore/configs/config.json >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      database:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+      - mapstore_extensions:/mnt/mapstore_extensions
+    environment:
+      - JAVA_OPTS=-Xms512m -Xmx512m -Dgeorchestra.datadir=/etc/georchestra -Dgeorchestra.extensions=/mnt/mapstore_extensions -DPRINT_BASE_URL=pdf
+    env_file:
+      - .envs-ldap
+      - .envs-database-georchestra
+    ports:
+      - 3001:8080
+    restart: always
+
+  postgis:
+    image: postgis/postgis:13-3.1-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    env_file:
+      - .envs-database-datafeeder
+    volumes:
+      - datafeeder_postgis_data:/var/lib/postgresql/data
+    restart: always
+
+  datafeeder:
+    image: georchestra/datafeeder:23.0.x
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8080/datafeeder >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      database:
+        condition: service_healthy
+      postgis:
+        condition: service_healthy
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+      - datafeeder_uploads:/tmp/datafeeder
+    environment:
+      - JAVA_OPTS=-Xms512m -Xmx512m
+      - LOGGING_LEVEL_ORG_GEORCHESTRA_DATAFEEDER=INFO
+    env_file:
+      - .envs-common
+      - .envs-hosts
+      - .envs-database-georchestra
+      - .envs-database-datafeeder
+    restart: always
+
+  import:
+    image: georchestra/datafeeder-frontend:23.0.x
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:80/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    restart: always
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.15.1
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:9200/_cat/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      envsubst:
+        condition: service_completed_successfully
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    restart: always
+    networks:
+      - demonet
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.15.1
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:5601/api/status >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    env_file:
+      - .envs-hosts
+    volumes:
+      - ./resources/kibana/kibana.yml:/usr/share/kibana/config/kibana.yml
+    networks:
+      - demonet
+    restart: always
+
+  ogc-api-records:
+    image: geonetwork/gn-cloud-ogc-api-records-service:4.2.2
+    depends_on:
+      geonetwork:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      LANG: en_US.UTF-8
+      SERVER_SERVLET_CONTEXT_PATH: /ogc-api-records
+      SPRING_CONFIG_LOCATION: file:///etc/georchestra/geonetwork/microservices/ogc-api-records/config.yml
+      SPRING_PROFILES_ACTIVE: standalone
+      JAVA_OPTS: -Dfile.encoding=UTF-8
+    volumes:
+      - georchestra_datadir:/etc/georchestra
+    restart: always
