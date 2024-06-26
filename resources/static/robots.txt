@@ -1,0 +1,14 @@
+Sitemap: /geonetwork/srv/api/sitemap
+
+User-agent: spatineo
+Allow: /geoserver/wms
+Allow: /geoserver/wfs
+Allow: /geoserver/wcs
+Allow: /geoserver/ows
+Allow: /geoserver/gwc/service/wms
+Allow: /geoserver/gwc/service/wmts
+Allow: /geoserver/gwc/service/tms/1.0.0
+Disallow: /
+
+User-agent: *
+Disallow: /geoserver/

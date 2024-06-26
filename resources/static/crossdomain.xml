@@ -1,0 +1,7 @@
+<?xml version="1.0" ?>
+<cross-domain-policy>
+   <allow-access-from domain="*" secure="false"/>
+   <allow-lax-ssl>true</allow-lax-ssl>
+   <allow-http-request-headers-from domain="*" headers="*"/>
+   <allow-https-request-headers-from domain="*" headers="*"/>
+</cross-domain-policy>
